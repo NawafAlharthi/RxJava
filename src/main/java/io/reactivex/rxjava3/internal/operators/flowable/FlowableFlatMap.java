@@ -224,23 +224,27 @@ public final class FlowableFlatMap<T, U> extends AbstractFlowableWithUpstream<T,
             return q;
         }
 
-        void tryEmitScalar(U value) {
+        private void emitValue(U value, SimpleQueue<U> q, boolean isScalar, InnerSubscriber<T, U> inner) {
             if (get() == 0 && compareAndSet(0, 1)) {
                 long r = requested.get();
-                SimpleQueue<U> q = queue;
                 if (r != 0L && (q == null || q.isEmpty())) {
                     downstream.onNext(value);
                     if (r != Long.MAX_VALUE) {
                         requested.decrementAndGet();
                     }
-                    if (maxConcurrency != Integer.MAX_VALUE
+                    if (isScalar && maxConcurrency != Integer.MAX_VALUE
                             && !cancelled && ++scalarEmitted == scalarLimit) {
                         scalarEmitted = 0;
                         upstream.request(scalarLimit);
+                    } else if (!isScalar) {
+                        inner.requestMore(1);
                     }
                 } else {
                     if (q == null) {
-                        q = getMainQueue();
+                        q = isScalar ? getMainQueue() : new SpscArrayQueue<>(bufferSize);
+                        if (!isScalar) {
+                            inner.queue = q;
+                        }
                     }
                     if (!q.offer(value)) {
                         onError(new QueueOverflowException());
@@ -250,7 +254,12 @@ public final class FlowableFlatMap<T, U> extends AbstractFlowableWithUpstream<T,
                     return;
                 }
             } else {
-                SimpleQueue<U> q = getMainQueue();
+                if (q == null) {
+                    q = isScalar ? getMainQueue() : new SpscArrayQueue<>(bufferSize);
+                    if (!isScalar) {
+                        inner.queue = q;
+                    }
+                }
                 if (!q.offer(value)) {
                     onError(new QueueOverflowException());
                     return;
@@ -262,43 +271,12 @@ public final class FlowableFlatMap<T, U> extends AbstractFlowableWithUpstream<T,
             drainLoop();
         }
 
+        void tryEmitScalar(U value) {
+            emitValue(value, queue, true, null);
+        }
+
         void tryEmit(U value, InnerSubscriber<T, U> inner) {
-            if (get() == 0 && compareAndSet(0, 1)) {
-                long r = requested.get();
-                SimpleQueue<U> q = inner.queue;
-                if (r != 0L && (q == null || q.isEmpty())) {
-                    downstream.onNext(value);
-                    if (r != Long.MAX_VALUE) {
-                        requested.decrementAndGet();
-                    }
-                    inner.requestMore(1);
-                } else {
-                    if (q == null) {
-                        q = new SpscArrayQueue<>(bufferSize);
-                        inner.queue = q;
-                    }
-                    if (!q.offer(value)) {
-                        onError(new QueueOverflowException());
-                    }
-                }
-                if (decrementAndGet() == 0) {
-                    return;
-                }
-            } else {
-                SimpleQueue<U> q = inner.queue;
-                if (q == null) {
-                    q = new SpscArrayQueue<>(bufferSize);
-                    inner.queue = q;
-                }
-                if (!q.offer(value)) {
-                    onError(new QueueOverflowException());
-                    return;
-                }
-                if (getAndIncrement() != 0) {
-                    return;
-                }
-            }
-            drainLoop();
+            emitValue(value, inner.queue, false, inner);
         }
 
         @Override
@@ -373,31 +351,9 @@ public final class FlowableFlatMap<T, U> extends AbstractFlowableWithUpstream<T,
                 long replenishMain = 0;
 
                 if (svq != null) {
-                    long scalarEmission = 0;
-                    U o = null;
-                    while (r != 0L) {
-                        o = svq.poll();
-
-                        if (checkTerminate()) {
-                            return;
-                        }
-                        if (o == null) {
-                            break;
-                        }
-
-                        child.onNext(o);
-
-                        replenishMain++;
-                        scalarEmission++;
-                        r--;
-                    }
-                    if (scalarEmission != 0L) {
-                        if (unbounded) {
-                            r = Long.MAX_VALUE;
-                        } else {
-                            r = requested.addAndGet(-scalarEmission);
-                        }
-                    }
+                    long newR = drainMainQueue(child, svq, r, unbounded, new long[]{replenishMain});
+                    if (newR == -1) return;
+                    r = newR;
                 }
 
                 boolean d = done;
@@ -559,6 +515,36 @@ public final class FlowableFlatMap<T, U> extends AbstractFlowableWithUpstream<T,
                 errors.tryTerminateAndReport();
             }
         }
+
+        private long drainMainQueue(Subscriber<? super U> child, SimplePlainQueue<U> svq, long r, boolean unbounded, long[] replenishMain) {
+            long scalarEmission = 0;
+            U o = null;
+            while (r != 0L) {
+                o = svq.poll();
+
+                if (checkTerminate()) {
+                    return -1;
+                }
+                if (o == null) {
+                    break;
+                }
+
+                child.onNext(o);
+
+                replenishMain[0]++;
+                scalarEmission++;
+                r--;
+            }
+            if (scalarEmission != 0L) {
+                if (unbounded) {
+                    r = Long.MAX_VALUE;
+                } else {
+                    r = requested.addAndGet(-scalarEmission);
+                }
+            }
+            return r;
+        }
+
 
         void innerError(InnerSubscriber<T, U> inner, Throwable t) {
             if (errors.tryAddThrowableOrReport(t)) {
